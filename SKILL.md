@@ -1,11 +1,11 @@
 ---
 name: save-on-foods-ordering
-description: Automate grocery ordering from Save-On-Foods (Canadian grocery chain). Uses Camoufox browser automation to log in, search for items, and add them to cart with specified quantities. Invoke when user wants to order groceries from Save-On-Foods.
+description: Automate grocery ordering from Save-On-Foods (Canadian grocery chain). Uses Camoufox browser automation to log in, search for items, and add them to cart. Supports two-step flow: search for products (returns JSON), then add specific SKUs. Invoke when user wants to order groceries from Save-On-Foods.
 license: MIT
 compatibility: Requires Node.js 18+, Python 3.8+, Playwright, and Camoufox. macOS tested. Credentials must be set in environment.
 metadata:
   author: legare
-  version: "1.0"
+  version: "1.1"
   store: Save-On-Foods
   region: Canada (BC focus)
 ---
@@ -35,37 +35,66 @@ Automates grocery ordering from Save-On-Foods using Camoufox (evasion-hardened F
    SAVEONFOODS_PASSWORD=your-password
    ```
 
-## Usage
+## Usage Modes
 
-### Direct Script Invocation (Recommended for Agents)
+### Mode 1: Search Only (Recommended for Agents)
 
-Run the automation script directly with `SEARCH_TERMS` environment variable:
-
-```bash
-cd {baseDir}
-SEARCH_TERMS="bananas@2, milk, bread" node scripts/login-via-saveonfoods-v2.js
-```
-
-**SEARCH_TERMS format:**
-- Comma-separated list of items
-- Optional `@N` suffix for quantity (e.g., `bananas@3` = 3 bananas)
-- Default quantity is 1 if not specified
-
-**Examples:**
-- `"milk"` - adds 1 milk
-- `"milk@2"` - adds 2 milk
-- `"bananas@3, milk@2, bread"` - adds 3 bananas, 2 milk, 1 bread
-
-### Interactive CLI (Optional)
-
-For human users who prefer natural language:
+Search for products and get JSON results without adding to cart. Allows the agent to choose the best product.
 
 ```bash
-cd {baseDir}
-node scripts/grocery-chat-cli.js
+SEARCH_ONLY=1 SEARCH_TERMS="milk, bread" node scripts/login-via-saveonfoods-v2.js
 ```
 
-Then type requests like: `order 2 bananas and milk`
+**Output:**
+```json
+{
+  "status": "search_results",
+  "results": [
+    {
+      "term": "milk",
+      "products": [
+        {"sku": "00068700011016", "name": "Dairyland - 2% Regular Milk", "brand": "Dairyland", "price": "$6.09"},
+        {"sku": "00068700100192", "name": "MILK 2 GO - 1% Partly Skimmed Milk", "brand": "MILK 2 GO", "price": "$3.05"},
+        {"sku": "00068700011009", "name": "Dairyland - 3.25% Milk", "brand": "Dairyland", "price": "$6.45"}
+      ]
+    }
+  ]
+}
+```
+
+### Mode 2: Add by SKU
+
+Add specific products to cart by SKU (from search results).
+
+```bash
+ADD_SKUS="00068700100192@2, 00068700011016" node scripts/login-via-saveonfoods-v2.js
+```
+
+**Output:**
+```json
+{
+  "status": "success",
+  "added": [
+    {"sku": "00068700100192", "success": true, "quantity": 2},
+    {"sku": "00068700011016", "success": true, "quantity": 1}
+  ],
+  "cartSummary": "Cart$9.14.3 Items"
+}
+```
+
+### Mode 3: Quick Add (Default)
+
+Search and add first result automatically (original behavior).
+
+```bash
+SEARCH_TERMS="bananas@2, milk" node scripts/login-via-saveonfoods-v2.js
+```
+
+### Recommended Two-Step Flow for Agents
+
+1. **Search:** `SEARCH_ONLY=1 SEARCH_TERMS="milk"` → get product options
+2. **Decide:** Agent picks best product (cheapest, preferred brand, etc.)
+3. **Add:** `ADD_SKUS="00068700100192@2"` → add selected SKU to cart
 
 ## Environment Variables
 
@@ -73,42 +102,20 @@ Then type requests like: `order 2 bananas and milk`
 |----------|----------|-------------|
 | `SAVEONFOODS_EMAIL` | Yes | Save-On-Foods / MoreRewards account email |
 | `SAVEONFOODS_PASSWORD` | Yes | Account password |
-| `SEARCH_TERMS` | Yes* | Comma-separated items to order (*for direct script) |
-| `HEADLESS` | No | Set to `1` for headless browser mode |
-| `LOG_NETWORK` | No | Set to `1` to enable network logging to `logs/network/` |
-
-## Output
-
-The script outputs JSON status to stdout:
-
-```json
-{"status": "success", "finalUrl": "https://www.saveonfoods.com/..."}
-```
-
-During execution, `[login]` prefixed messages indicate progress:
-- `[login] Navigating to...`
-- `[login] Filling credentials...`
-- `[login] Added item {"term": "milk", "requestedQuantity": 2, ...}`
-- `[login] Cart summary: 3 items`
-
-## How It Works
-
-1. Launches Camoufox browser with anti-detection measures
-2. Navigates to saveonfoods.com
-3. If not already logged in, redirects through MoreRewards SSO
-4. For each item in SEARCH_TERMS:
-   - Searches for the item
-   - Clicks "Add to Cart" on first result
-   - Increments quantity if > 1
-5. Outputs cart summary and exits
+| `SEARCH_ONLY` | No | Set `1` to return search results as JSON without adding |
+| `SEARCH_TERMS` | No | Comma-separated search terms |
+| `ADD_SKUS` | No | Comma-separated SKUs to add (format: `sku@qty` or just `sku`) |
+| `MAX_PRODUCTS` | No | Max products per search result (default: 10) |
+| `HEADLESS` | No | Set `1` for headless browser mode |
+| `LOG_NETWORK` | No | Set `1` to log network requests |
 
 ## Session Persistence
 
-The script stores browser session data in `.pw-user/` directory. Subsequent runs may skip login if the session is still valid.
+Browser session stored in `.pw-user/`. Subsequent runs skip login if session is valid.
 
 ## Limitations
 
-- Only tested on macOS
-- Geolocation is spoofed to Vancouver, BC area
-- Adds first search result for each term (no product selection)
+- macOS tested only
+- Geolocation spoofed to Vancouver, BC
 - Does not complete checkout (stops at cart)
+- No cart viewing or item removal (yet)

@@ -5,6 +5,11 @@
   const path = require('path');
   const { spawnSync } = require('child_process');
 
+  // Operation modes
+  const SEARCH_ONLY = process.env.SEARCH_ONLY === '1';
+  const ADD_SKUS = process.env.ADD_SKUS || '';
+  const MAX_PRODUCTS = Number(process.env.MAX_PRODUCTS) || 10;
+
   function resolveCamoufoxExecutable() {
     if (process.env.CAMOUFOX_EXECUTABLE) return process.env.CAMOUFOX_EXECUTABLE;
 
@@ -33,6 +38,9 @@
     networkLogStream = fs.createWriteStream(logPath, { flags: 'a' });
     console.log(`[netlog] writing network log to ${logPath}`);
   }
+
+  // Store for captured product data (used in SEARCH_ONLY mode)
+  const capturedProducts = new Map();
 
   const shouldTrackUrl = (url) => /saveonfoods\.com|morerewards|pattisonfoodgroup/i.test(url);
 
@@ -74,6 +82,57 @@
     context = await browser.newContext({ viewport: { width: 1366, height: 860 }, locale: 'en-CA', timezoneId: 'America/Vancouver' });
   }
 
+  // Always listen for product search responses to capture product data
+  context.on('response', async (response) => {
+    if (!shouldTrackUrl(response.url())) return;
+
+    try {
+      const ct = response.headers()['content-type'] || '';
+      if (/application\/json/i.test(ct)) {
+        const json = await response.json().catch(() => null);
+
+        // Capture product data from search/preview API
+        if (json && /\/preview\?/i.test(response.url())) {
+          const term = (() => {
+            try { return new URL(response.url()).searchParams.get('q') || ''; }
+            catch { return ''; }
+          })();
+          const products = Array.isArray(json.products)
+            ? json.products.slice(0, MAX_PRODUCTS).map((product) => ({
+                sku: product.sku,
+                name: product.name,
+                brand: product.brand || null,
+                price: product.price || product.priceNumeric || null,
+                size: product.packageSize || product.size || null,
+                image: product.imageUrl || null,
+              }))
+            : [];
+          if (products.length) {
+            capturedProducts.set(term.toLowerCase(), { term, products });
+            if (enableNetworkLogging) {
+              writeNetworkLog({ ts: Date.now(), type: 'preview_summary', term, products });
+            }
+          }
+        }
+
+        // Log full response if network logging enabled
+        if (enableNetworkLogging) {
+          writeNetworkLog({
+            ts: Date.now(),
+            type: 'response',
+            url: response.url(),
+            status: response.status(),
+            body: json,
+          });
+        }
+      }
+    } catch (err) {
+      if (enableNetworkLogging) {
+        writeNetworkLog({ ts: Date.now(), type: 'response_error', url: response.url(), error: String(err.message || err) });
+      }
+    }
+  });
+
   if (enableNetworkLogging) {
     context.on('request', (request) => {
       if (!shouldTrackUrl(request.url())) return;
@@ -96,47 +155,6 @@
         url: request.url(),
         error: request.failure(),
       });
-    });
-
-    context.on('response', async (response) => {
-      if (!shouldTrackUrl(response.url())) return;
-      const entry = {
-        ts: Date.now(),
-        type: 'response',
-        url: response.url(),
-        status: response.status(),
-        headers: response.headers(),
-      };
-      try {
-        const ct = response.headers()['content-type'] || '';
-        if (/application\/json/i.test(ct)) {
-          const json = await response.json().catch(() => null);
-          entry.body = json;
-          if (json && /\/preview\?/i.test(response.url())) {
-            const term = (() => {
-              try { return new URL(response.url()).searchParams.get('q') || ''; }
-              catch { return ''; }
-            })();
-            const topProducts = Array.isArray(json.products)
-              ? json.products.slice(0, 3).map((product) => ({
-                  sku: product.sku,
-                  name: product.name,
-                  price: product.price || product.priceNumeric || null,
-                }))
-              : [];
-            if (topProducts.length && enableNetworkLogging) {
-              writeNetworkLog({ ts: Date.now(), type: 'preview_summary', term, topProducts });
-              log('Preview summary', { term, topProducts });
-            }
-          }
-        } else if (/text\//i.test(ct)) {
-          const text = await response.text().catch(() => null);
-          if (text && text.length <= 2000) entry.body = text;
-        }
-      } catch (err) {
-        entry.bodyError = String(err.message || err);
-      }
-      writeNetworkLog(entry);
     });
   }
 
@@ -185,6 +203,143 @@
     })();
   }
 
+  // Helper: perform a search and wait for results
+  async function performSearch(page, term) {
+    log(`Searching for ${term}`);
+    if (enableNetworkLogging) writeNetworkLog({ ts: Date.now(), type: 'step', step: 'search', term });
+
+    const searchInput = page.locator('#searchInputField-desktop, #searchInputField-mobile, input[placeholder*="Search" i]').first();
+    await searchInput.waitFor({ state: 'visible', timeout: timeout.wait });
+    try { await searchInput.click({ clickCount: 3 }); } catch {}
+    await searchInput.fill(term, { timeout: timeout.wait });
+
+    const searchSubmit = page.locator('[data-testid="SearchInput-button-testId"], button[aria-label="Submit search query"]').first();
+    const submitVisible = await searchSubmit.isVisible({ timeout: 2000 }).catch(() => false);
+    if (submitVisible) {
+      await searchSubmit.click().catch(() => searchInput.press('Enter'));
+    } else {
+      await searchInput.press('Enter').catch(() => {});
+    }
+
+    await page.waitForLoadState('domcontentloaded', { timeout: timeout.nav }).catch(() => {});
+    // Wait for add-to-cart buttons to appear (indicates results loaded)
+    await page.locator('[data-testid^="addToCart_"]').first().waitFor({ state: 'visible', timeout: timeout.wait }).catch(() => {});
+    // Small delay to ensure product data is captured from API response
+    await page.waitForTimeout(500);
+  }
+
+  // Helper: add item to cart by SKU
+  async function addToCartBySku(page, sku, quantity) {
+    const addButton = page.locator(`[data-testid="addToCart_${sku}-button-testId"]`).first();
+    const exists = await addButton.count();
+    if (!exists) {
+      log(`SKU not found on page: ${sku}`);
+      return { sku, success: false, error: 'SKU not found on page' };
+    }
+
+    await addButton.scrollIntoViewIfNeeded().catch(() => {});
+    const cartResponse = page
+      .waitForResponse(
+        (response) => response.request().method() === 'POST' && /\/api\/stores\/\d+\/cart/i.test(response.url()),
+        { timeout: timeout.nav }
+      )
+      .catch(() => null);
+    await Promise.all([
+      cartResponse,
+      addButton.click({ timeout: timeout.wait }),
+    ]);
+    if (enableNetworkLogging) writeNetworkLog({ ts: Date.now(), type: 'step', step: 'add_to_cart', sku, requestedQuantity: quantity });
+
+    // Handle quantity > 1
+    if (quantity > 1) {
+      const productCard = addButton.locator('xpath=ancestor::article[contains(@class,"ProductCardWrapper")]');
+      const increment = productCard.locator('button[data-testid="QuantityStepperIncrementButton"]').first();
+
+      if (await increment.count()) {
+        for (let i = 1; i < quantity; i += 1) {
+          const incrementResponse = page
+            .waitForResponse(
+              (response) => response.request().method() === 'POST' && /\/api\/stores\/\d+\/cart/i.test(response.url()),
+              { timeout: timeout.nav }
+            )
+            .catch(() => null);
+          await Promise.all([
+            incrementResponse,
+            increment.click({ timeout: timeout.wait }).catch(() => {}),
+          ]);
+        }
+      }
+    }
+
+    log(`Added to cart: ${sku} x${quantity}`);
+    return { sku, success: true, quantity };
+  }
+
+  // SEARCH_ONLY mode: search for terms and return product options as JSON
+  async function runSearchOnlyFlow(page) {
+    const rawTerms = process.env.SEARCH_TERMS ? process.env.SEARCH_TERMS.split(',') : [];
+    const terms = rawTerms.map(t => t.trim()).filter(Boolean);
+
+    if (!terms.length) {
+      console.log(JSON.stringify({ status: 'error', message: 'No SEARCH_TERMS provided' }));
+      return;
+    }
+
+    const results = [];
+    for (const term of terms) {
+      await performSearch(page, term);
+      const captured = capturedProducts.get(term.toLowerCase());
+      results.push({
+        term,
+        products: captured ? captured.products : [],
+      });
+    }
+
+    console.log(JSON.stringify({ status: 'search_results', results }, null, 2));
+  }
+
+  // ADD_SKUS mode: add specific products by SKU
+  async function runAddSkusFlow(page) {
+    // Parse ADD_SKUS format: "sku1@qty,sku2@qty" or just "sku1,sku2"
+    const skuEntries = ADD_SKUS.split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(entry => {
+        const match = entry.match(/^(.+?)@(\d+)$/);
+        if (match) {
+          return { sku: match[1].trim(), quantity: Math.max(1, Number(match[2])) };
+        }
+        return { sku: entry, quantity: 1 };
+      });
+
+    if (!skuEntries.length) {
+      console.log(JSON.stringify({ status: 'error', message: 'No SKUs provided in ADD_SKUS' }));
+      return;
+    }
+
+    // We need to search for something to get to a product page first
+    // Use the first SKU as a search term (should find the product)
+    const added = [];
+    for (const { sku, quantity } of skuEntries) {
+      // Search for the SKU to navigate to a page where it might appear
+      await performSearch(page, sku);
+      const result = await addToCartBySku(page, sku, quantity);
+      added.push(result);
+    }
+
+    // Get cart summary
+    let cartSummary = '';
+    try {
+      const miniCart = page.locator('[data-testid="minicart-button-testId"]').first();
+      if (await miniCart.count()) {
+        cartSummary = (await miniCart.textContent() || '').trim();
+      }
+    } catch {}
+
+    console.log(JSON.stringify({ status: 'success', added, cartSummary }, null, 2));
+  }
+
+  // Default mode: search and add first result (original behavior)
   async function runShoppingFlow(page) {
     const rawTerms = process.env.SEARCH_TERMS ? process.env.SEARCH_TERMS.split(',') : ['milk', 'bread', 'apples'];
     const parsedTerms = rawTerms
@@ -203,25 +358,9 @@
 
     for (const entry of parsedTerms) {
       const { term, quantity } = entry;
-      log(`Searching for ${term}`);
-      if (enableNetworkLogging) writeNetworkLog({ ts: Date.now(), type: 'step', step: 'search', term });
-      const searchInput = page.locator('#searchInputField-desktop, #searchInputField-mobile, input[placeholder*="Search" i]').first();
-      await searchInput.waitFor({ state: 'visible', timeout: timeout.wait });
-      try { await searchInput.click({ clickCount: 3 }); } catch {}
-      await searchInput.fill(term, { timeout: timeout.wait });
-
-      const searchSubmit = page.locator('[data-testid="SearchInput-button-testId"], button[aria-label="Submit search query"]').first();
-      const submitVisible = await searchSubmit.isVisible({ timeout: 2000 }).catch(() => false);
-      if (submitVisible) {
-        await searchSubmit.click().catch(() => searchInput.press('Enter'));
-      } else {
-        await searchInput.press('Enter').catch(() => {});
-      }
-
-      await page.waitForLoadState('domcontentloaded', { timeout: timeout.nav }).catch(() => {});
+      await performSearch(page, term);
 
       const addButtons = page.locator('[data-testid^="addToCart_"]');
-      await addButtons.first().waitFor({ state: 'visible', timeout: timeout.wait }).catch(() => {});
       const buttonCount = await addButtons.count();
       if (!buttonCount) {
         log('No add-to-cart buttons visible after search', { term });
@@ -431,11 +570,19 @@
     if (onSaveOn && !looksSignedOut) {
       log('SSO success on saveonfoods.com', { finalUrl });
       try {
-        await runShoppingFlow(finalPage);
+        // Choose flow based on mode
+        if (SEARCH_ONLY) {
+          await runSearchOnlyFlow(finalPage);
+        } else if (ADD_SKUS) {
+          await runAddSkusFlow(finalPage);
+        } else {
+          await runShoppingFlow(finalPage);
+          console.log(JSON.stringify({ status: 'success', finalUrl }));
+        }
       } catch (flowErr) {
         log('Post-login shopping flow error', flowErr);
+        console.log(JSON.stringify({ status: 'error', message: String(flowErr.message || flowErr) }));
       }
-      console.log(JSON.stringify({ status: 'success', finalUrl }));
       await context.storageState({ path: 'storageState.json' }).catch(() => {});
       if (networkLogStream) networkLogStream.close();
       if (browser) await browser.close(); else await context.close();

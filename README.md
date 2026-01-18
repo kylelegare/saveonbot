@@ -8,7 +8,7 @@ Uses [Camoufox](https://github.com/nickmilo/camoufox) (evasion-hardened Firefox)
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/YOUR_USERNAME/saveonbot.git
+git clone https://github.com/kylelegare/saveonbot.git
 cd saveonbot
 npm install
 
@@ -23,70 +23,114 @@ cp .env.example .env
 
 # 4. Run
 source venv/bin/activate
-SEARCH_TERMS="bananas@2, milk, bread" node scripts/login-via-saveonfoods-v2.js
+SEARCH_ONLY=1 SEARCH_TERMS="milk" node scripts/login-via-saveonfoods-v2.js
 ```
 
-## Usage
+## Usage Modes
 
-### For AI Agents / Programmatic Use
+### Mode 1: Search Only (Returns JSON)
 
-Set `SEARCH_TERMS` environment variable and run the script directly:
+Search for products without adding to cart. Returns product options as JSON.
 
 ```bash
-SEARCH_TERMS="bananas@2, milk, bread" node scripts/login-via-saveonfoods-v2.js
+SEARCH_ONLY=1 SEARCH_TERMS="milk, bread" node scripts/login-via-saveonfoods-v2.js
 ```
 
-**SEARCH_TERMS format:**
-- Comma-separated list of items
-- `@N` suffix for quantity (e.g., `milk@2` for 2 milk)
-- Default quantity is 1
+**Output:**
+```json
+{
+  "status": "search_results",
+  "results": [
+    {
+      "term": "milk",
+      "products": [
+        {"sku": "00068700011016", "name": "Dairyland - 2% Milk", "brand": "Dairyland", "price": "$6.09"},
+        {"sku": "00068700100192", "name": "MILK 2 GO - 1% Milk", "brand": "MILK 2 GO", "price": "$3.05"}
+      ]
+    }
+  ]
+}
+```
 
-### For Humans (Interactive CLI)
+### Mode 2: Add by SKU
+
+Add specific products to cart using SKUs from search results.
+
+```bash
+ADD_SKUS="00068700100192@2, 00068700011016" node scripts/login-via-saveonfoods-v2.js
+```
+
+**Output:**
+```json
+{
+  "status": "success",
+  "added": [{"sku": "00068700100192", "success": true, "quantity": 2}],
+  "cartSummary": "Cart$6.10.2 Items"
+}
+```
+
+### Mode 3: Quick Add (Default)
+
+Search and add first result automatically.
+
+```bash
+SEARCH_TERMS="bananas@2, milk" node scripts/login-via-saveonfoods-v2.js
+```
+
+### Recommended Flow for AI Agents
+
+1. **Search:** `SEARCH_ONLY=1 SEARCH_TERMS="milk"` → get options
+2. **Decide:** Pick best product (cheapest, preferred brand, etc.)
+3. **Add:** `ADD_SKUS="00068700100192@2"` → add to cart
+
+### Interactive CLI (For Humans)
 
 ```bash
 node scripts/grocery-chat-cli.js
 ```
 
-Then type naturally: `order 2 bananas and milk`
+Then type: `order 2 bananas and milk`
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `SAVEONFOODS_EMAIL` | Yes | Your Save-On-Foods / MoreRewards email |
-| `SAVEONFOODS_PASSWORD` | Yes | Your password |
-| `SEARCH_TERMS` | Yes* | Items to order (*for direct script) |
+| `SAVEONFOODS_EMAIL` | Yes | Save-On-Foods / MoreRewards email |
+| `SAVEONFOODS_PASSWORD` | Yes | Account password |
+| `SEARCH_ONLY` | No | Set `1` to return JSON without adding |
+| `SEARCH_TERMS` | No | Comma-separated search terms |
+| `ADD_SKUS` | No | SKUs to add (format: `sku@qty,sku@qty`) |
+| `MAX_PRODUCTS` | No | Max products per search (default: 10) |
 | `HEADLESS` | No | Set `1` for headless mode |
-| `LOG_NETWORK` | No | Set `1` to log network requests |
 
 ## How It Works
 
 1. Launches Camoufox browser (anti-detection Firefox)
 2. Navigates to saveonfoods.com
-3. Authenticates via MoreRewards SSO (if not already logged in)
-4. For each item: searches, clicks "Add to Cart", adjusts quantity
-5. Outputs JSON status and cart summary
+3. Authenticates via MoreRewards SSO (if needed)
+4. Executes requested mode (search/add/quick-add)
+5. Returns JSON result
 
-Session data is cached in `.pw-user/` so subsequent runs can skip login.
+Session cached in `.pw-user/` - subsequent runs skip login.
 
 ## AgentSkills Compatible
 
-This project follows the [agentskills.io](https://agentskills.io) open skill format. See `SKILL.md` for the skill definition.
+Follows [agentskills.io](https://agentskills.io) open skill format. See `SKILL.md`.
 
 Works with [Clawdbot](https://clawd.bot/) and other skills-compatible AI agents.
 
 ## Requirements
 
-- macOS (tested), Linux (untested)
+- macOS (tested)
 - Node.js 18+
 - Python 3.8+
 - Save-On-Foods / MoreRewards account
 
 ## Limitations
 
-- Adds first search result for each item (no product picker)
 - Does not complete checkout (stops at cart)
-- Geolocation spoofed to Vancouver, BC area
+- No cart viewing or item removal (yet)
+- Geolocation spoofed to Vancouver, BC
 
 ## License
 
