@@ -1,0 +1,23 @@
+# Credentials (IMPORTANT - never commit)
+.env
+
+# Dependencies
+node_modules/
+venv/
+
+# Browser session data
+.pw-user/
+storageState.json
+
+# Logs and debug output
+logs/
+*.png
+*.log
+
+# OS files
+.DS_Store
+
+# IDE
+.claude/
+.vscode/
+.idea/
